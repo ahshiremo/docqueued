@@ -1,6 +1,7 @@
 package jobs
 
 import (
+	"context"
 	"errors"
 	"strconv"
 	"strings"
@@ -8,22 +9,36 @@ import (
 )
 
 var (
-	ErrBlankText = errors.New("text must not be blank")
-	ErrQueueFull = errors.New("queue is currently full")
-	ErrNotFound  = errors.New("job not found")
+	ErrBlankText      = errors.New("text must not be blank")
+	ErrQueueFull      = errors.New("queue is currently full")
+	ErrNotFound       = errors.New("job not found")
+	ErrNotStarted     = errors.New("service has not started")
+	ErrAlreadyStarted = errors.New("service has already started")
+	ErrDraining       = errors.New("service is draining")
 )
 
 type Service struct {
-	mu        sync.Mutex
-	jobs      map[string]Job
-	pending   chan string
-	nextId    uint64
-	processor func(string) Result
+	mu sync.Mutex
+
+	jobs    map[string]Job
+	pending chan string
+	nextId  uint64
+
+	processor   Processor
+	workerCount int
+
+	started  bool
+	draining bool
+	cancel   context.CancelFunc
+	done     chan struct{}
 }
 
-func NewService(queueCapacity int, processor func(string) Result) (*Service, error) {
+func NewService(queueCapacity int, workerCount int, processor Processor) (*Service, error) {
 	if queueCapacity < 1 {
 		return nil, errors.New("queue capacity must be positive")
+	}
+	if workerCount < 1 {
+		return nil, errors.New("worker count must be positive")
 	}
 
 	if processor == nil {
@@ -31,19 +46,31 @@ func NewService(queueCapacity int, processor func(string) Result) (*Service, err
 	}
 
 	return &Service{
-		jobs:      make(map[string]Job),
-		pending:   make(chan string, queueCapacity),
-		processor: processor,
+		jobs:        make(map[string]Job),
+		pending:     make(chan string, queueCapacity),
+		processor:   processor,
+		workerCount: workerCount,
+		done:        make(chan struct{}),
 	}, nil
 }
 
 func (s *Service) Submit(text string) (Job, error) {
-	if strings.TrimSpace(text) == "" {
-		return Job{}, ErrBlankText
-	}
+	blank := strings.TrimSpace(text) == ""
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	if s.draining {
+		return Job{}, ErrDraining
+	}
+
+	if !s.started {
+		return Job{}, ErrNotStarted
+	}
+
+	if blank {
+		return Job{}, ErrBlankText
+	}
 
 	s.nextId++
 	job := Job{
@@ -76,28 +103,88 @@ func (s *Service) Get(id string) (Job, error) {
 	return job, nil
 }
 
-func (s *Service) ProcessNext() bool {
-	var id string
+func (s *Service) processJob(ctx context.Context, id string) {
+	s.mu.Lock()
 
-	select {
-	case id = <-s.pending:
-	default:
-		return false
+	job := s.jobs[id]
+	err := ctx.Err()
+
+	if err == nil {
+		job.Status = StatusRunning
+		s.jobs[id] = job
+	}
+
+	s.mu.Unlock()
+
+	var result Result
+	if err == nil {
+		result, err = s.processor(ctx, job.Text)
 	}
 
 	s.mu.Lock()
-	job := s.jobs[id]
-	job.Status = StatusRunning
+	defer s.mu.Unlock()
+
+	if err != nil {
+		job.Status = StatusFailed
+		job.Result = Result{}
+		job.Failure = FailureProcessing
+
+		if errors.Is(err, context.Canceled) ||
+			errors.Is(err, context.DeadlineExceeded) {
+			job.Failure = FailureCancelled
+		}
+	} else {
+		job.Status = StatusCompleted
+		job.Result = result
+		job.Failure = ""
+	}
+
 	s.jobs[id] = job
-	s.mu.Unlock()
+}
 
-	result := s.processor(job.Text)
-
+func (s *Service) BeginDrain() {
 	s.mu.Lock()
-	job.Result = result
-	job.Status = StatusCompleted
-	s.jobs[id] = job
+	defer s.mu.Unlock()
+
+	if s.draining {
+		return
+	}
+	s.draining = true
+	close(s.pending)
+
+	if !s.started {
+		close(s.done)
+	}
+}
+
+func (s *Service) Cancel() {
+	s.BeginDrain()
+
+	if s.cancel != nil {
+		s.cancel()
+	}
+}
+
+func (s *Service) Wait(ctx context.Context) error {
+	s.mu.Lock()
+	started := s.started
 	s.mu.Unlock()
 
-	return true
+	if !started {
+		return ErrNotStarted
+	}
+
+	select {
+	case <-s.done:
+		return nil
+	default:
+	}
+
+	select {
+	case <-s.done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+
 }
