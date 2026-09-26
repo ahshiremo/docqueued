@@ -1,6 +1,7 @@
 package jobs
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"sync"
@@ -8,44 +9,88 @@ import (
 	"time"
 )
 
-func newTestService(t *testing.T, capacity int) *Service {
+func newRunningTestService(t *testing.T, capacity, workers int, processor Processor) *Service {
 	t.Helper()
 
-	service, err := NewService(capacity, Process)
+	service, err := NewService(capacity, workers, processor)
 	if err != nil {
 		t.Fatalf("NewService() failed: %v", err)
 	}
+
+	if err := service.Start(); err != nil {
+		t.Fatalf("Start() failed: %v", err)
+	}
+
+	t.Cleanup(func() {
+		service.Cancel()
+		waitCtx, cancelWait := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancelWait()
+
+		if err := service.Wait(waitCtx); err != nil {
+			t.Errorf("service cleanup failed: %v", err)
+		}
+	})
+
 	return service
+}
+
+func waitForTestSignal(t *testing.T, signal <-chan struct{}, description string) {
+	t.Helper()
+
+	select {
+	case <-signal:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("timed out waiting for %s", description)
+	}
 }
 
 func TestNewService(t *testing.T) {
 	tests := []struct {
 		name      string
 		capacity  int
-		processor func(string) Result
+		workers   int
+		processor Processor
 		wantErr   bool
 	}{
 		{
 			"valid configuration",
 			2,
-			Process,
+			1,
+			ProcessWithContext,
 			false,
 		},
 		{
 			"zero capacity",
 			0,
-			Process,
+			1,
+			ProcessWithContext,
 			true,
 		},
 		{
 			"negative capacity",
 			-1,
-			Process,
+			1,
+			ProcessWithContext,
 			true,
+		},
+		{
+			name:      "zero workers",
+			capacity:  2,
+			workers:   0,
+			processor: ProcessWithContext,
+			wantErr:   true,
+		},
+		{
+			name:      "negative workers",
+			capacity:  2,
+			workers:   -1,
+			processor: ProcessWithContext,
+			wantErr:   true,
 		},
 		{
 			"nil processor",
 			2,
+			1,
 			nil,
 			true,
 		},
@@ -53,7 +98,7 @@ func TestNewService(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			service, err := NewService(tt.capacity, tt.processor)
+			service, err := NewService(tt.capacity, tt.workers, tt.processor)
 			if tt.wantErr {
 				if err == nil {
 					t.Error("expected an error, got nil")
@@ -74,32 +119,50 @@ func TestNewService(t *testing.T) {
 				t.Fatal("expected a service, got nil")
 			}
 
-			if service.ProcessNext() {
-				t.Error("new service unexpectedly had pending work")
+			if len(service.jobs) != 0 || len(service.pending) != 0 {
+				t.Error("new service unexpectedly contains work")
 			}
 		})
 	}
 }
 
 func TestService_Get(t *testing.T) {
-	service := newTestService(t, 1)
+	service := newRunningTestService(t, 1, 1, ProcessWithContext)
+	text := "hello world"
 
-	submitted, err := service.Submit("hello world")
+	submitted, err := service.Submit(text)
 	if err != nil {
-		t.Fatalf("Submit() failed %v", err)
+		t.Fatalf("Submit() failed: %v", err)
+	}
+
+	service.BeginDrain()
+
+	waitCtx, cancelWait := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelWait()
+
+	if err := service.Wait(waitCtx); err != nil {
+		t.Fatalf("Wait() failed: %v", err)
+	}
+
+	want := Job{
+		ID:     submitted.ID,
+		Text:   text,
+		Status: StatusCompleted,
+		Result: Process(text),
 	}
 
 	snapshot, err := service.Get(submitted.ID)
 	if err != nil {
-		t.Fatalf("Get() failed %v", err)
+		t.Fatalf("Get() failed: %v", err)
 	}
 
-	if snapshot != submitted {
-		t.Fatalf("Get() = %+v,  want %+v", snapshot, submitted)
+	if snapshot != want {
+		t.Fatalf("Get() = %+v, want %+v", snapshot, want)
 	}
 
-	snapshot.Text = "change by caller"
-	snapshot.Status = StatusCompleted
+	snapshot.Text = "changed by caller"
+	snapshot.Status = StatusFailed
+	snapshot.Failure = FailureProcessing
 	snapshot.Result = Result{
 		WordCount: 999,
 		SHA256:    "changed",
@@ -107,16 +170,16 @@ func TestService_Get(t *testing.T) {
 
 	stored, err := service.Get(submitted.ID)
 	if err != nil {
-		t.Fatalf("second Get() failed %v", err)
+		t.Fatalf("second Get() failed: %v", err)
 	}
 
-	if stored != submitted {
-		t.Errorf("stored job changed: got %+v,  want %+v", stored, submitted)
+	if stored != want {
+		t.Errorf("stored job changed: got %+v, want %+v", stored, want)
 	}
 }
 
 func TestService_GetNotFound(t *testing.T) {
-	service := newTestService(t, 1)
+	service := newRunningTestService(t, 1, 1, ProcessWithContext)
 	job, err := service.Get("not found")
 
 	if !errors.Is(err, ErrNotFound) {
@@ -129,7 +192,7 @@ func TestService_GetNotFound(t *testing.T) {
 }
 
 func TestService_Submit(t *testing.T) {
-	service := newTestService(t, 1)
+	service := newRunningTestService(t, 1, 1, ProcessWithContext)
 	text := "\thello, world!\t"
 
 	job, err := service.Submit(text)
@@ -165,7 +228,7 @@ func TestService_SubmitWhitespaceOnly(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			service := newTestService(t, 1)
+			service := newRunningTestService(t, 1, 1, ProcessWithContext)
 			job, err := service.Submit(tt.text)
 
 			if !errors.Is(err, ErrBlankText) {
@@ -176,6 +239,13 @@ func TestService_SubmitWhitespaceOnly(t *testing.T) {
 				t.Errorf("job = %v, expected empty", job)
 			}
 
+			service.BeginDrain()
+			waitCtx, cancelWait := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancelWait()
+			if err := service.Wait(waitCtx); err != nil {
+				t.Fatalf("Wait() failed: %v", err)
+			}
+
 			if len(service.jobs) != 0 || len(service.pending) != 0 {
 				t.Errorf("jobs length = %d, pending length = %d, expected 0", len(service.jobs), len(service.pending))
 			}
@@ -184,14 +254,26 @@ func TestService_SubmitWhitespaceOnly(t *testing.T) {
 }
 
 func TestService_SubmitQueueFull(t *testing.T) {
-	service := newTestService(t, 1)
+	started := make(chan struct{})
+	processor := func(ctx context.Context, _ string) (Result, error) {
+		close(started)
+		<-ctx.Done()
+		return Result{}, ctx.Err()
+	}
+	service := newRunningTestService(t, 1, 1, processor)
 
 	first, err := service.Submit("document one")
 	if err != nil {
 		t.Fatalf("first Submit() failed: %v", err)
 	}
+	waitForTestSignal(t, started, "the worker to take the first job")
 
-	rejected, err := service.Submit("document two")
+	second, err := service.Submit("document two")
+	if err != nil {
+		t.Fatalf("second Submit() failed: %v", err)
+	}
+
+	rejected, err := service.Submit("document three")
 
 	if !errors.Is(err, ErrQueueFull) {
 		t.Errorf("error = %v, want ErrQueueFull", err)
@@ -201,25 +283,34 @@ func TestService_SubmitQueueFull(t *testing.T) {
 		t.Errorf("rejected job = %+v, want an empty Job", rejected)
 	}
 
-	if len(service.jobs) != 1 || len(service.pending) != 1 {
+	service.mu.Lock()
+	storedCount := len(service.jobs)
+	service.mu.Unlock()
+
+	if storedCount != 2 || len(service.pending) != 1 {
 		t.Errorf(
-			"stored=%d, pending=%d, want 1 each",
-			len(service.jobs),
+			"stored=%d, pending=%d, want 2 stored and 1 pending",
+			storedCount,
 			len(service.pending),
 		)
 	}
 
-	stored, err := service.Get(first.ID)
-	if err != nil {
-		t.Fatalf("Get() failed: %v", err)
+	expected := []Job{
+		{ID: first.ID, Text: "document one", Status: StatusRunning},
+		{ID: second.ID, Text: "document two", Status: StatusQueued},
 	}
-
-	if stored != first {
-		t.Errorf("accepted job changed: got %+v, want %+v", stored, first)
+	for _, want := range expected {
+		stored, err := service.Get(want.ID)
+		if err != nil {
+			t.Fatalf("Get(%q) failed: %v", want.ID, err)
+		}
+		if stored != want {
+			t.Errorf("accepted job = %+v, want %+v", stored, want)
+		}
 	}
 }
 
-func TestService_ProcessNext(t *testing.T) {
+func TestService_Processing(t *testing.T) {
 	text := "hello\tworld!"
 	result := Result{
 		WordCount: 2,
@@ -229,24 +320,25 @@ func TestService_ProcessNext(t *testing.T) {
 	var received string
 	var calls int
 
-	processor := func(input string) Result {
+	processor := func(_ context.Context, input string) (Result, error) {
 		received = input
 		calls++
-		return result
+		return result, nil
 	}
 
-	service, err := NewService(1, processor)
-	if err != nil {
-		t.Fatalf("NewService() failed: %v", err)
-	}
+	service := newRunningTestService(t, 1, 1, processor)
 
 	submitted, err := service.Submit(text)
 	if err != nil {
 		t.Fatalf("Submit() failed: %v", err)
 	}
 
-	if !service.ProcessNext() {
-		t.Fatalf("expected job %q to be processed", submitted.ID)
+	service.BeginDrain()
+	waitCtx, cancelWait := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelWait()
+
+	if err := service.Wait(waitCtx); err != nil {
+		t.Fatalf("Wait() failed: %v", err)
 	}
 
 	completed, err := service.Get(submitted.ID)
@@ -269,29 +361,56 @@ func TestService_ProcessNext(t *testing.T) {
 		t.Errorf("processor received %q, want %q", received, text)
 	}
 
-	if service.ProcessNext() {
-		t.Error("drained queue unexpectedly reported processing work")
-	}
-
 	if calls != 1 {
 		t.Errorf("processor calls = %d, want 1", calls)
 	}
 }
 
 func TestService_QueueCapacityReused(t *testing.T) {
-	service := newTestService(t, 1)
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	secondStarted := make(chan struct{})
+
+	processor := func(ctx context.Context, text string) (Result, error) {
+		switch text {
+		case "document one":
+			close(firstStarted)
+			select {
+			case <-releaseFirst:
+			case <-ctx.Done():
+				return Result{}, ctx.Err()
+			}
+		case "document two":
+			close(secondStarted)
+			<-ctx.Done()
+			return Result{}, ctx.Err()
+		}
+
+		return ProcessWithContext(ctx, text)
+	}
+
+	service := newRunningTestService(t, 1, 1, processor)
 	first, err := service.Submit("document one")
 	if err != nil {
 		t.Fatalf("first Submit() failed: %v", err)
 	}
-
-	if !service.ProcessNext() {
-		t.Fatal("expected the first job to be processed")
-	}
+	waitForTestSignal(t, firstStarted, "the first job to start")
 
 	second, err := service.Submit("document two")
 	if err != nil {
-		t.Fatalf("Submit() after processing failed: %v", err)
+		t.Fatalf("second Submit() failed: %v", err)
+	}
+
+	if _, err := service.Submit("document three"); !errors.Is(err, ErrQueueFull) {
+		t.Fatalf("error before freeing capacity = %v, want ErrQueueFull", err)
+	}
+
+	close(releaseFirst)
+	waitForTestSignal(t, secondStarted, "the worker to finish the first job and take the second")
+
+	third, err := service.Submit("document three")
+	if err != nil {
+		t.Fatalf("Submit() after freeing capacity failed: %v", err)
 	}
 
 	completed, err := service.Get(first.ID)
@@ -309,24 +428,42 @@ func TestService_QueueCapacityReused(t *testing.T) {
 		t.Errorf("completed job = %+v, want %+v", completed, wantCompleted)
 	}
 
-	queued, err := service.Get(second.ID)
+	running, err := service.Get(second.ID)
 	if err != nil {
 		t.Fatalf("Get(second) failed: %v", err)
 	}
 
-	wantQueued := Job{
+	wantRunning := Job{
 		ID:     second.ID,
 		Text:   "document two",
+		Status: StatusRunning,
+	}
+	if running != wantRunning {
+		t.Errorf("running job = %+v, want %+v", running, wantRunning)
+	}
+
+	queued, err := service.Get(third.ID)
+	if err != nil {
+		t.Fatalf("Get(third) failed: %v", err)
+	}
+
+	wantQueued := Job{
+		ID:     third.ID,
+		Text:   "document three",
 		Status: StatusQueued,
 	}
 	if queued != wantQueued {
 		t.Errorf("queued job = %+v, want %+v", queued, wantQueued)
 	}
 
-	if len(service.jobs) != 2 || len(service.pending) != 1 {
+	service.mu.Lock()
+	storedCount := len(service.jobs)
+	service.mu.Unlock()
+
+	if storedCount != 3 || len(service.pending) != 1 {
 		t.Errorf(
-			"stored=%d, pending=%d, want 2 stored and 1 pending",
-			len(service.jobs),
+			"stored=%d, pending=%d, want 3 stored and 1 pending",
+			storedCount,
 			len(service.pending),
 		)
 	}
@@ -336,53 +473,48 @@ func TestService_ProcessingDoesNotHoldMutex(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})
 
-	processor := func(_ string) Result {
-		close(started)
-		<-release
+	processor := func(ctx context.Context, text string) (Result, error) {
+		if text == "document one" {
+			close(started)
+			select {
+			case <-release:
+			case <-ctx.Done():
+				return Result{}, ctx.Err()
+			}
+		}
 
 		return Result{
 			WordCount: 2,
 			SHA256:    "test-digest",
-		}
+		}, nil
 	}
 
-	service, err := NewService(1, processor)
-	if err != nil {
-		t.Fatalf("NewService() failed: %v", err)
-	}
-	if service == nil {
-		t.Fatal("expected a service")
-	}
+	service := newRunningTestService(t, 1, 1, processor)
 
 	first, err := service.Submit("document one")
 	if err != nil {
 		t.Fatalf("Submit() failed: %v", err)
 	}
 
-	processingDone := make(chan struct{})
 	accessDone := make(chan struct{})
 
 	t.Cleanup(func() {
 		close(release)
-		<-processingDone
-		<-accessDone
-	})
-
-	go func() {
-		defer close(processingDone)
-
-		if !service.ProcessNext() {
-			t.Errorf("expected job %q to be processed", first.ID)
+		service.Cancel()
+		select {
+		case <-accessDone:
+		case <-time.After(5 * time.Second):
+			t.Error("lookup/submission goroutine did not exit during cleanup")
 		}
-	}()
+	})
 
 	go func() {
 		defer close(accessDone)
 
 		select {
 		case <-started:
-		case <-processingDone:
-			t.Error("processing finished without reaching the processor")
+		case <-service.done:
+			t.Error("workers stopped without reaching the processor")
 			return
 		}
 
@@ -416,7 +548,7 @@ func TestService_ProcessingDoesNotHoldMutex(t *testing.T) {
 func TestService_ConcurrentOperations(t *testing.T) {
 	const count = 32
 
-	service := newTestService(t, count)
+	service := newRunningTestService(t, count, 4, ProcessWithContext)
 	submitted := make([]Job, count)
 	start := make(chan struct{})
 
@@ -443,14 +575,18 @@ func TestService_ConcurrentOperations(t *testing.T) {
 				t.Errorf("unexpected snapshot for %q: %+v", text, snapshot)
 			}
 
-			if !service.ProcessNext() {
-				t.Errorf("expected pending work after submitting %q", text)
-			}
 		}(i)
 	}
 
 	close(start)
 	wg.Wait()
+
+	service.BeginDrain()
+	waitCtx, cancelWait := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelWait()
+	if err := service.Wait(waitCtx); err != nil {
+		t.Fatalf("Wait() failed: %v", err)
+	}
 
 	seen := make(map[string]bool)
 
