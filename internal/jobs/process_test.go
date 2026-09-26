@@ -94,15 +94,3 @@ func TestProcessSHA256(t *testing.T) {
 		})
 	}
 }
-
-func TestProcessWithContext(t *testing.T) {
-	t.Skip()
-}
-
-func TestProcessWithContextCancelled(t *testing.T) {
-	t.Skip()
-}
-
-func TestProcessWithContextDeadlineExceeded(t *testing.T) {
-	t.Skip()
-}
