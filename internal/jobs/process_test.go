@@ -1,6 +1,9 @@
 package jobs
 
 import (
+	"context"
+	"errors"
+	"strconv"
 	"testing"
 )
 
@@ -92,5 +95,37 @@ func TestProcessSHA256(t *testing.T) {
 				)
 			}
 		})
+	}
+}
+
+func TestProcessWithContext(t *testing.T) {
+	for _, text := range []string{"", "hello world", " \thello\u2003world\n"} {
+		t.Run(strconv.Quote(text), func(t *testing.T) {
+			got, err := ProcessWithContext(context.Background(), text)
+			if err != nil {
+				t.Fatalf("ProcessWithContext() failed: %v", err)
+			}
+			if want := Process(text); got != want {
+				t.Errorf("result = %+v, want %+v", got, want)
+			}
+		})
+	}
+}
+
+func TestProcessWithContextCancelled(t *testing.T) {
+	workerCtx, cancelWorker := context.WithCancel(context.Background())
+	cancelWorker()
+	got, err := ProcessWithContext(workerCtx, "hello world")
+	if !errors.Is(err, context.Canceled) || got != (Result{}) {
+		t.Errorf("ProcessWithContext() = (%+v, %v), want empty result and Canceled", got, err)
+	}
+}
+
+func TestProcessWithContextDeadlineExceeded(t *testing.T) {
+	workerCtx, cancelWorker := context.WithTimeout(context.Background(), 0)
+	defer cancelWorker()
+	got, err := ProcessWithContext(workerCtx, "hello world")
+	if !errors.Is(err, context.DeadlineExceeded) || got != (Result{}) {
+		t.Errorf("ProcessWithContext() = (%+v, %v), want empty result and DeadlineExceeded", got, err)
 	}
 }

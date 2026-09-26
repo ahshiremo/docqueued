@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-func newTestService(t *testing.T, capacity, workers int, processor Processor) *Service {
+func newRunningTestService(t *testing.T, capacity, workers int, processor Processor) *Service {
 	t.Helper()
 
 	service, err := NewService(capacity, workers, processor)
@@ -23,10 +23,10 @@ func newTestService(t *testing.T, capacity, workers int, processor Processor) *S
 
 	t.Cleanup(func() {
 		service.Cancel()
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
+		waitCtx, cancelWait := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancelWait()
 
-		if err := service.Wait(ctx); err != nil {
+		if err := service.Wait(waitCtx); err != nil {
 			t.Errorf("service cleanup failed: %v", err)
 		}
 	})
@@ -127,7 +127,7 @@ func TestNewService(t *testing.T) {
 }
 
 func TestService_Get(t *testing.T) {
-	service := newTestService(t, 1, 1, ProcessWithContext)
+	service := newRunningTestService(t, 1, 1, ProcessWithContext)
 	text := "hello world"
 
 	submitted, err := service.Submit(text)
@@ -137,10 +137,10 @@ func TestService_Get(t *testing.T) {
 
 	service.BeginDrain()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+	waitCtx, cancelWait := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelWait()
 
-	if err := service.Wait(ctx); err != nil {
+	if err := service.Wait(waitCtx); err != nil {
 		t.Fatalf("Wait() failed: %v", err)
 	}
 
@@ -179,7 +179,7 @@ func TestService_Get(t *testing.T) {
 }
 
 func TestService_GetNotFound(t *testing.T) {
-	service := newTestService(t, 1, 1, ProcessWithContext)
+	service := newRunningTestService(t, 1, 1, ProcessWithContext)
 	job, err := service.Get("not found")
 
 	if !errors.Is(err, ErrNotFound) {
@@ -192,7 +192,7 @@ func TestService_GetNotFound(t *testing.T) {
 }
 
 func TestService_Submit(t *testing.T) {
-	service := newTestService(t, 1, 1, ProcessWithContext)
+	service := newRunningTestService(t, 1, 1, ProcessWithContext)
 	text := "\thello, world!\t"
 
 	job, err := service.Submit(text)
@@ -228,7 +228,7 @@ func TestService_SubmitWhitespaceOnly(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			service := newTestService(t, 1, 1, ProcessWithContext)
+			service := newRunningTestService(t, 1, 1, ProcessWithContext)
 			job, err := service.Submit(tt.text)
 
 			if !errors.Is(err, ErrBlankText) {
@@ -240,9 +240,9 @@ func TestService_SubmitWhitespaceOnly(t *testing.T) {
 			}
 
 			service.BeginDrain()
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			if err := service.Wait(ctx); err != nil {
+			waitCtx, cancelWait := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancelWait()
+			if err := service.Wait(waitCtx); err != nil {
 				t.Fatalf("Wait() failed: %v", err)
 			}
 
@@ -260,7 +260,7 @@ func TestService_SubmitQueueFull(t *testing.T) {
 		<-ctx.Done()
 		return Result{}, ctx.Err()
 	}
-	service := newTestService(t, 1, 1, processor)
+	service := newRunningTestService(t, 1, 1, processor)
 
 	first, err := service.Submit("document one")
 	if err != nil {
@@ -326,7 +326,7 @@ func TestService_Processing(t *testing.T) {
 		return result, nil
 	}
 
-	service := newTestService(t, 1, 1, processor)
+	service := newRunningTestService(t, 1, 1, processor)
 
 	submitted, err := service.Submit(text)
 	if err != nil {
@@ -334,10 +334,10 @@ func TestService_Processing(t *testing.T) {
 	}
 
 	service.BeginDrain()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+	waitCtx, cancelWait := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelWait()
 
-	if err := service.Wait(ctx); err != nil {
+	if err := service.Wait(waitCtx); err != nil {
 		t.Fatalf("Wait() failed: %v", err)
 	}
 
@@ -389,7 +389,7 @@ func TestService_QueueCapacityReused(t *testing.T) {
 		return ProcessWithContext(ctx, text)
 	}
 
-	service := newTestService(t, 1, 1, processor)
+	service := newRunningTestService(t, 1, 1, processor)
 	first, err := service.Submit("document one")
 	if err != nil {
 		t.Fatalf("first Submit() failed: %v", err)
@@ -489,7 +489,7 @@ func TestService_ProcessingDoesNotHoldMutex(t *testing.T) {
 		}, nil
 	}
 
-	service := newTestService(t, 1, 1, processor)
+	service := newRunningTestService(t, 1, 1, processor)
 
 	first, err := service.Submit("document one")
 	if err != nil {
@@ -548,7 +548,7 @@ func TestService_ProcessingDoesNotHoldMutex(t *testing.T) {
 func TestService_ConcurrentOperations(t *testing.T) {
 	const count = 32
 
-	service := newTestService(t, count, 4, ProcessWithContext)
+	service := newRunningTestService(t, count, 4, ProcessWithContext)
 	submitted := make([]Job, count)
 	start := make(chan struct{})
 
@@ -582,9 +582,9 @@ func TestService_ConcurrentOperations(t *testing.T) {
 	wg.Wait()
 
 	service.BeginDrain()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if err := service.Wait(ctx); err != nil {
+	waitCtx, cancelWait := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelWait()
+	if err := service.Wait(waitCtx); err != nil {
 		t.Fatalf("Wait() failed: %v", err)
 	}
 
